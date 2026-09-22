@@ -142,6 +142,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
   const recoveryPages = new Map<string, { cursor?: string; page?: Awaited<ReturnType<Inbox['mailboxSnapshot']>>; index: number }>()
   const work = new Set<Promise<unknown>>()
   const configVersion = digest(configuration ? { version: configuration.version, endpoint: configuration.endpoint, models: configuration.models, output: configuration.maxOutputTokens } : null)
+  const inferenceSession = (owner: string, source: string, thread: string) => createHmac('sha256', sessionKey).update(JSON.stringify(['ai-session', owner, source, thread])).digest('hex')
   const hashIdentity = (owner: string, value: string) => createHmac('sha256', sessionKey).update(`${owner}\0${value.trim().toLowerCase()}`).digest('hex')
   const key = (owner: string, source: string, thread: string) => JSON.stringify([owner, source, thread])
   const transaction = <T>(fn: () => T) => db.transaction(fn)()
@@ -849,7 +850,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     if (!permitted(queue) || controller.signal.aborted) return
     const attempt = beginAttempt(queue, value.model, context.hash)
     let result: AiInferenceResult
-    try { result = await inferAiTriage(context.input, configuration!, { model: value.model, signal: controller.signal, fetcher, retrying: queue.attempts > 0, rules: ruleTexts(value) }) }
+    try { result = await inferAiTriage(context.input, configuration!, { model: value.model, signal: controller.signal, sessionId: inferenceSession(queue.owner, queue.source, queue.thread), fetcher, retrying: queue.attempts > 0, rules: ruleTexts(value) }) }
     catch { finishAttempt(queue.owner, attempt, null); if (permitted(queue)) transaction(() => finishDecision(queue, context, null, 'AI_REQUEST_FAILED')); return }
     let current: Context | null = null
     if (permitted(queue) && !controller.signal.aborted) { try { current = await prepare(queue.owner, queue.source, queue.thread, contextSettings(settings(queue.owner))) } catch {} }
@@ -1204,7 +1205,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
         const controller = new AbortController()
         const result = await inferAiRule({ note: input.note, conversation: { subjects: [...new Set(items.map(item => item.subject))], senderDomains: domains, type: prior?.assessment?.type ?? null,
           reason: prior?.assessment?.reason ?? null, topics: prior?.assessment?.topics ?? [], currentCategory: prior?.override?.category ?? prior?.score?.category ?? null },
-          existingRules: (value.rules ?? []).map(item => ({ id: item.id, text: item.text })) }, configuration, { model: value.model, signal: controller.signal, fetcher })
+          existingRules: (value.rules ?? []).map(item => ({ id: item.id, text: item.text })) }, configuration, { model: value.model, signal: controller.signal, sessionId: inferenceSession(owner, input.sourceId, input.threadId), fetcher })
         if (result.outcome !== 'completed' || !result.draft) fail(result.code ?? 'AI_RULE_FAILED', 502)
         rule = { id: input.id, text: result.draft.text, category: result.draft.category, createdAt: stamp(now()) }
         supersedes = result.draft.supersedes

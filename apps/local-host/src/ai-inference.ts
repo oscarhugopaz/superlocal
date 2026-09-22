@@ -347,11 +347,24 @@ async function responseJson(response: Response, signal: AbortSignal): Promise<un
   } finally { signal.removeEventListener('abort', cancel); reader.releaseLock() }
 }
 
+/** OpenCode Go routes by conversation; Muse supports only automatic tool choice. */
+function inferenceRequest(config: AiInferenceConfig, model: string, sessionId?: string) {
+  const endpoint = new URL(config.endpoint)
+  const go = endpoint.hostname === 'opencode.ai' && endpoint.pathname === '/zen/go/v1/responses'
+  const headers: Record<string, string> = { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json', Accept: 'application/json' }
+  if (go) {
+    if (!sessionId || !/^[a-f0-9]{64}$/.test(sessionId)) fail('AI_INPUT_INVALID')
+    headers['x-opencode-session'] = sessionId
+    headers['User-Agent'] = 'superlocal/1.0'
+  }
+  return { headers, toolChoice: go && model.startsWith('muse-spark-') ? undefined : 'none' }
+}
+
 /** One transport attempt only. The host owns retries, concurrency, and durable accounting. */
 export async function inferAiTriage(
   input: AiTriageInput,
   config: AiInferenceConfig,
-  options: { model: string; signal: AbortSignal; fetcher?: typeof fetch; retrying?: boolean; rules?: readonly string[] },
+  options: { model: string; signal: AbortSignal; sessionId?: string; fetcher?: typeof fetch; retrying?: boolean; rules?: readonly string[] },
 ): Promise<AiInferenceResult> {
   const started = performance.now()
   const result: AiInferenceResult = {
@@ -375,9 +388,10 @@ export async function inferAiTriage(
     if (options.signal.aborted) { result.outcome = 'aborted'; result.code = 'AI_ABORTED'; return finish() }
     options.signal.addEventListener('abort', abort, { once: true })
     timer = setTimeout(() => { timedOut = true; controller.abort() }, effective.timeoutMs)
+    const request = inferenceRequest(effective, selected.id, options.sessionId)
     const work = async () => {
       const body = JSON.stringify({
-        model: selected.id, store: false, stream: false, tools: [], tool_choice: 'none', truncation: 'disabled', reasoning: { effort: effective.reasoningEffort },
+        model: selected.id, store: false, stream: false, tools: [], tool_choice: request.toolChoice, truncation: 'disabled', reasoning: { effort: effective.reasoningEffort },
         max_output_tokens: effective.maxOutputTokens, instructions: renderAiRules(options.rules ?? []) + instructions + (options.retrying ? '\nRecheck evidence carefully: copy short literal source phrases for every required field. Do not paraphrase or invent quotes. Use unknown if the source does not establish a claim.' : ''),
         input: [{ role: 'user', content: JSON.stringify(input) }],
         text: { format: { type: 'json_schema', name: 'triage_result_v2', strict: true, schema: assessmentSchema } },
@@ -385,7 +399,7 @@ export async function inferAiTriage(
       if (Buffer.byteLength(body, 'utf8') > 32_768) fail('AI_INPUT_LIMIT')
       const response = await (options.fetcher ?? fetch)(effective.endpoint, {
         method: 'POST', redirect: 'error', signal: controller.signal,
-        headers: { Authorization: `Bearer ${effective.apiKey}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+        headers: request.headers,
         body,
       })
       if (controller.signal.aborted) { void response.body?.cancel().catch(() => {}); fail('AI_ABORTED') }
@@ -476,7 +490,7 @@ const ruleSchema = {
 }
 
 /** One bounded request that generalizes a user's note into a rule. Interactive: the caller handles failure by asking the user again. */
-export async function inferAiRule(input: AiRuleDraftInput, config: AiInferenceConfig, options: { model: string; signal: AbortSignal; fetcher?: typeof fetch }): Promise<AiRuleDraftResult> {
+export async function inferAiRule(input: AiRuleDraftInput, config: AiInferenceConfig, options: { model: string; signal: AbortSignal; sessionId?: string; fetcher?: typeof fetch }): Promise<AiRuleDraftResult> {
   const result: AiRuleDraftResult = { outcome: 'error', draft: null, code: null, usage: emptyUsage() }
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), Math.min(30_000, config.timeoutMs ?? 30_000))
@@ -490,12 +504,13 @@ export async function inferAiRule(input: AiRuleDraftInput, config: AiInferenceCo
       subjects: input.conversation.subjects.slice(0, 3).map(value => value.slice(0, 200)), senderDomains: input.conversation.senderDomains.slice(0, 3).map(value => value.slice(0, 120)),
       type: input.conversation.type, reason: input.conversation.reason?.slice(0, 400) ?? null, topics: input.conversation.topics.slice(0, 8).map(value => value.slice(0, 80)), currentCategory: input.conversation.currentCategory },
       ...(input.existingRules?.length ? { existingRules: input.existingRules.slice(0, 64).map(rule => ({ id: rule.id, text: rule.text.slice(0, 240) })) } : {}) }
+    const request = inferenceRequest(effective, options.model, options.sessionId)
     const body = JSON.stringify({
-      model: options.model, store: false, stream: false, tools: [], tool_choice: 'none', truncation: 'disabled', reasoning: { effort: effective.reasoningEffort }, max_output_tokens: 600, instructions: ruleInstructions,
+      model: options.model, store: false, stream: false, tools: [], tool_choice: request.toolChoice, truncation: 'disabled', reasoning: { effort: effective.reasoningEffort }, max_output_tokens: 600, instructions: ruleInstructions,
       input: [{ role: 'user', content: JSON.stringify(bounded) }], text: { format: { type: 'json_schema', name: 'triage_rule_v1', strict: true, schema: ruleSchema } },
     })
     const response = await (options.fetcher ?? fetch)(effective.endpoint, { method: 'POST', redirect: 'error', signal: controller.signal,
-      headers: { Authorization: `Bearer ${effective.apiKey}`, 'Content-Type': 'application/json', Accept: 'application/json' }, body })
+      headers: request.headers, body })
     if (!response.ok) { void response.body?.cancel().catch(() => {}); result.code = response.status === 429 ? 'AI_RATE_LIMITED' : response.status === 401 || response.status === 403 ? 'AI_AUTH_FAILED' : response.status >= 500 ? 'AI_PROVIDER_UNAVAILABLE' : 'AI_HTTP_FAILED'; return result }
     const data = await responseJson(response, controller.signal)
     if (!object(data) || data.status !== 'completed' || !Array.isArray(data.output)) { result.code = 'AI_RESPONSE_INVALID'; return result }

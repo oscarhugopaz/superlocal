@@ -12610,7 +12610,7 @@ describe('bounded thread ordering', () => {
   }, 30_000)
 })
 
-import { inferAiTriage, loadAiInferenceConfig, prepareAiText, publicAiProvider, validateAiAssessment, type AiInferenceConfig } from '../../../apps/local-host/src/ai-inference'
+import { inferAiRule, inferAiTriage, loadAiInferenceConfig, prepareAiText, publicAiProvider, validateAiAssessment, type AiInferenceConfig } from '../../../apps/local-host/src/ai-inference'
 import { countAiTopicMatches, normalizeAiTopics, scoreAiTriage } from '../../../apps/local-host/src/ai-preferences'
 import { AI_INPUT_POLICY_VERSION, AI_PREFERENCE_VERSION, AI_TRIAGE_VERSION, type AiAssessment, type AiDecision, type AiScoreSignals, type AiTriageInput } from '../../../apps/shared/ai-triage'
 
@@ -12763,6 +12763,39 @@ describe('AI triage inference and local scoring', () => {
     expect(result.estimate?.maximumUsd).toBeCloseTo(0.0026, 10)
     expect(result.estimate?.complete).toBe(true)
     expect(JSON.stringify(result)).not.toContain(configuration.apiKey)
+  })
+
+  test('OpenCode Go sessions and Muse tool compatibility apply to triage and rules only on the Go endpoint', async () => {
+    const sessionId = 'a'.repeat(64)
+    for (const endpoint of ['https://opencode.ai/zen/go/v1/responses', configuration.endpoint, 'https://opencode.ai/zen/v1/responses']) {
+      for (const model of ['muse-spark-1.3-contributor', 'gpt-5.6-luna']) {
+        const config = { ...configuration, endpoint, defaultModel: model, models: [{ id: model, label: model, pricing: null }] }
+        const go = endpoint === 'https://opencode.ai/zen/go/v1/responses'
+        let calls = 0
+        const fetcher = (async (_url, init) => {
+          calls++
+          const headers = new Headers(init?.headers)
+          expect(headers.get('Authorization')).toBe(`Bearer ${config.apiKey}`)
+          expect(headers.get('x-opencode-session')).toBe(go ? sessionId : null)
+          expect(headers.get('User-Agent')).toBe(go ? 'superlocal/1.0' : null)
+          const body = JSON.parse(String(init?.body))
+          expect(body.tools).toEqual([])
+          if (go && model.startsWith('muse-spark-')) expect(body).not.toHaveProperty('tool_choice')
+          else expect(body.tool_choice).toBe('none')
+          const content = body.text.format.name === 'triage_rule_v1'
+            ? { text: 'Proposal requests are important.', category: 'Important', supersedes: [] } : request
+          return Response.json({ ...response, model, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(content) }] }] })
+        }) as typeof fetch
+        const options = { model, sessionId, signal: new AbortController().signal, fetcher }
+        expect((await inferAiTriage(input, config, options)).outcome).toBe('completed')
+        expect((await inferAiRule({ note: 'Keep proposals important.', conversation: { subjects: ['Proposal'], senderDomains: [], type: null, reason: null, topics: [], currentCategory: null } }, config, options)).outcome).toBe('completed')
+        expect(calls).toBe(2)
+        if (go) {
+          expect((await inferAiTriage(input, config, { ...options, sessionId: undefined })).code).toBe('AI_INPUT_INVALID')
+          expect(calls).toBe(2)
+        }
+      }
+    }
   })
 
   test('invalid refused incomplete and empty responses retain nullable measured usage without treating unknown counts as free', async () => {
@@ -14056,12 +14089,14 @@ describe('AI triage service', () => {
     const h = await fixture(), database = new Database(':memory:')
     const seeds = [native('taught-alert'), native('taught-other')]
     const { account, box } = await h.seed('alice', 'ai-taught-rules', seeds)
-    const requests: Array<{ instructions: string; schema: string; content: Record<string, unknown> }> = []
+    const requests: Array<{ session: string; instructions: string; schema: string; content: Record<string, unknown> }> = []
     const ruleResponse = { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify({ text: 'Fixture vendor account alerts are not important.', category: 'Other' }) }] }] }
-    const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+    const service = createAiTriageService({ database, inbox: h.inbox, configuration: { ...configuration, endpoint: 'https://opencode.ai/zen/go/v1/responses' }, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
       fetcher: (async (_url, init) => {
         const body = JSON.parse(String(init?.body))
-        requests.push({ instructions: body.instructions, schema: body.text.format.name, content: JSON.parse(body.input[0].content) })
+        const session = new Headers(init?.headers).get('x-opencode-session')!
+        expect(session).toMatch(/^[a-f0-9]{64}$/)
+        requests.push({ session, instructions: body.instructions, schema: body.text.format.name, content: JSON.parse(body.input[0].content) })
         return Response.json(body.text.format.name === 'triage_rule_v1' ? ruleResponse : response)
       }) as typeof fetch })
     cleanup.push(async () => { await service.close(); database.close() })
@@ -14072,6 +14107,8 @@ describe('AI triage service', () => {
     const alert = (await h.page('alice')).items.find(item => item.subject === seeds[0]!.subject)!
     const before = (await service.lookup('alice', [{ sourceId: account.id, threadId: alert.threadId }])).decisions[0]!
     expect(before).toMatchObject({ state: 'ready', override: null })
+    expect(new Set(requests.map(request => request.session)).size).toBe(2)
+    const alertSession = requests.find(request => request.schema === 'triage_result_v2' && JSON.stringify(request.content).includes(seeds[0]!.subject))!.session
     await expect(service.teach('alice', { sourceId: account.id, threadId: alert.threadId, id: 'ai-taught-rule-1', note: '   ' })).rejects.toMatchObject({ code: 'AI_INVALID_FEEDBACK' })
     const fenceBefore = database.query("SELECT revision FROM local_ai_settings_fence WHERE owner='alice'").get()
     const taught = await service.teach('alice', { sourceId: account.id, threadId: alert.threadId, id: 'ai-taught-rule-1', note: 'Do not mark these as important anymore' })
@@ -14081,6 +14118,7 @@ describe('AI triage service', () => {
     expect((await service.results('alice')).decisions.every(item => item.state === 'ready')).toBe(true)
     // The rule request carries the note plus content-light context only: no message text, addresses, or names.
     const ruleRequest = requests.find(request => request.schema === 'triage_rule_v1')!
+    expect(ruleRequest.session).toBe(alertSession)
     expect(ruleRequest.content).toEqual({ note: 'Do not mark these as important anymore', conversation: expect.objectContaining({ subjects: [seeds[0]!.subject], type: 'other', currentCategory: expect.any(String) }) })
     expect(JSON.stringify(ruleRequest.content)).not.toContain('@')
     expect(taught.rule).toMatchObject({ id: 'ai-taught-rule-1', text: 'Fixture vendor account alerts are not important.', category: 'Other' })
@@ -14111,6 +14149,7 @@ describe('AI triage service', () => {
     ruleResponse.output[0]!.content[0]!.text = JSON.stringify({ text: 'Fixture vendor account alerts are important after all.', category: 'Important', supersedes: ['ai-taught-rule-1'] })
     const corrected = await service.teach('alice', { sourceId: account.id, threadId: alert.threadId, id: 'ai-taught-rule-2', note: 'Actually these matter' })
     expect(requests.filter(request => request.schema === 'triage_rule_v1').at(-1)!.content).toMatchObject({ existingRules: [{ id: 'ai-taught-rule-1', text: 'Fixture vendor account alerts are not important.' }] })
+    expect(requests.filter(request => request.schema === 'triage_rule_v1').every(request => request.session === alertSession)).toBe(true)
     expect(corrected.superseded.map(rule => rule.id)).toEqual(['ai-taught-rule-1'])
     expect(corrected.state.settings.rules!.map(rule => rule.id)).toEqual(['ai-taught-rule-2'])
     await bounded((async () => { while ((await service.state('alice')).jobs.find(job => job.id === 'ai-taught-rule-2:resort')?.status !== 'completed') await Bun.sleep(10) })(), 'corrected re-sort')
