@@ -22,9 +22,21 @@ import { escapeHTML, plainText } from "./mail-text";
 import { loadSnippets } from "./Snippets";
 import {
   canUseQuickReplies,
+  emptyDraftBody,
   quickReplyBody,
   type QuickReply,
 } from "./quick-replies";
+
+function signatureHtml(value: string) {
+  return escapeHTML(value).replaceAll("\n", "<br>");
+}
+
+// The editor serializes parsed markup, so compare against the browser's own rendering.
+function renderedSignature(value: string) {
+  const probe = document.createElement("div");
+  probe.innerHTML = signatureHtml(value);
+  return probe.textContent ?? "";
+}
 
 type ComposerProps = {
   draft: Draft;
@@ -353,8 +365,34 @@ export default function Composer({
   current.current = draft;
   const signatures = preferences.signaturesByAccount as
     Record<string, string> | undefined;
-  const signature = signatures?.[draft.account] ?? preferences.signature;
   const mailbox = accounts.find(account => account.id === draft.account);
+  const signature =
+    (mailbox && signatures?.[mailbox.email]) ?? preferences.signature;
+  // Any signature a mailbox may carry lets a moved draft's trailing signature be recognized.
+  const signatureCandidates = new Set(
+    [...Object.values(signatures ?? {}), preferences.signature]
+      .filter(Boolean)
+      .map(renderedSignature),
+  );
+  const syncSignature = (element: HTMLElement) => {
+    const node = [...element.children]
+      .reverse()
+      .find(child => signatureCandidates.has(child.textContent ?? ""));
+    if (signature) {
+      if (node) {
+        const next = signatureHtml(signature);
+        if (node.innerHTML !== next) node.innerHTML = next;
+      } else if (
+        emptyDraftBody(element.innerHTML) &&
+        (draft.mode === "new" || preferences.signatureReplies !== false)
+      ) {
+        element.insertAdjacentHTML(
+          "beforeend",
+          `<div><br></div><div><br></div><div>${signatureHtml(signature)}</div>`,
+        );
+      }
+    } else if (node) node.remove();
+  };
   const sourceLocked = draft.mode !== "new" || !!draft.sourceMessageId;
   const replyMailbox = mailbox && (!draft.sourceId || mailbox.sourceId === draft.sourceId) ? mailbox
     : accounts.find(account => account.canSend && account.sourceId === draft.sourceId);
@@ -490,7 +528,8 @@ export default function Composer({
   }
 
   useLayoutEffect(() => {
-    if (!editor.current) return;
+    const element = editor.current;
+    if (!element) return;
     let body = draft.body;
     const opened = initialized.current !== draft.id;
     if (opened) {
@@ -507,20 +546,27 @@ export default function Composer({
       } catch {
         setReminder("");
       }
-      if (
-        !body &&
-        preferences.signatureEnabled &&
-        signature &&
-        (draft.mode === "new" || preferences.signatureReplies !== false)
-      ) {
-        body = `<div><br></div><div><br></div><div>${escapeHTML(signature).replaceAll("\n", "<br>")}</div>`;
+    }
+    // Do not replace the editable DOM on each keystroke: that would reset its caret.
+    if (element.innerHTML !== body) element.innerHTML = body;
+    if (opened && preferences.signatureEnabled) {
+      syncSignature(element);
+      if (element.innerHTML !== body) {
+        body = element.innerHTML;
         update({ body });
       }
     }
-    // Do not replace the editable DOM on each keystroke: that would reset its caret.
-    if (editor.current.innerHTML !== body) editor.current.innerHTML = body;
     if (opened && autoFocus) focusComposer();
   }, [draft.id, draft.body]);
+
+  // Switching From (same composer or a moved draft) swaps the trailing signature.
+  useLayoutEffect(() => {
+    const element = editor.current;
+    if (!element || !preferences.signatureEnabled) return;
+    const before = element.innerHTML;
+    syncSignature(element);
+    if (element.innerHTML !== before) update({ body: element.innerHTML });
+  }, [signature]);
 
   useLayoutEffect(() => {
     if (focusRequest > 0) focusComposer();
