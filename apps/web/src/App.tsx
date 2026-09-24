@@ -1146,18 +1146,19 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     sourceMessageId?: string,
   ) {
     if (!currentMail) return;
+    const resolvedMode = mode === "reply" && preferences.defaultReply === "Reply all" ? "replyAll" : mode;
     setReplyRequest((value) => value + 1);
     const existing =
       currentDraft && (currentDraft.threadId === currentMail.id || currentDraft.sourceId === currentMail.sourceId && currentMail.messages.some(message => message.id === currentDraft.sourceMessageId)) ? currentDraft : undefined;
     if (existing) {
       store.editDraft({ ...existing, popOut: popOut || existing.popOut, updated: Date.now() });
-      if (existing.mode !== mode || sourceMessageId && existing.sourceMessageId !== sourceMessageId)
+      if (existing.mode !== resolvedMode || sourceMessageId && existing.sourceMessageId !== sourceMessageId)
         setNotice({
           text: "Resumed your saved draft. Discard it to change its reply or forward target.",
         });
       return;
     }
-    try { await store.newDraft(route.account, { mode, popOut, mail: currentMail, sourceMessageId }); }
+    try { await store.newDraft(route.account, { mode: resolvedMode, popOut, mail: currentMail, sourceMessageId }); }
     catch (error) { actionError(error); }
   }
   async function composeContact() {
