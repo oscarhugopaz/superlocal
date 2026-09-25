@@ -385,7 +385,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       const credentials = credentialsFor(provider, await jsonBody(request))
       if (connect[2] && !provider.reconnect) return problem(409, 'HOST_RECONNECT_UNAVAILABLE', 'This provider requires a new authorization flow.')
       try {
-        return Response.json(await (connect[2] ? provider.reconnect!(liveInbox, owner, connect[2], credentials) : provider.connect(liveInbox, owner, credentials, origin!)), { headers: safeHeaders })
+        return Response.json(await (connect[2] ? provider.reconnect!(liveInbox, owner, connect[2], credentials, origin!) : provider.connect(liveInbox, owner, credentials, origin!)), { headers: safeHeaders })
       } catch (error) { throw connectFailure(error, provider.descriptor.name) }
     }
     // Browser credentials go ONLY through the declared host onboarding fields, never raw SDK connection APIs.

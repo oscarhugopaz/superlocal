@@ -55,7 +55,7 @@ export interface HostProviderRegistration {
   definition: ProviderDefinition
   descriptor: Omit<HostProvider, 'connectionIds'>
   connect?(inbox: Inbox, owner: string, credentials: Record<string, string>, origin: string): Promise<ConnectResult>
-  reconnect?(inbox: Inbox, owner: string, connectionId: string, credentials: Record<string, string>): Promise<ConnectResult>
+  reconnect?(inbox: Inbox, owner: string, connectionId: string, credentials: Record<string, string>, origin: string): Promise<ConnectResult>
   mount?(inbox: Inbox, authenticate: InboxApiOptions['authenticate']): HostExtension
 }
 
@@ -173,17 +173,24 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
       return coordinator ??= createGoogleOAuthHost({ inbox, database: runtime.database, encryptionKey: runtime.encryptionKey, config: googleConfig })
     }
     const definition = { ...pinned(base), scopes: config.providers.gmail.oauth.scopes, refresh: createGoogleCredentialRefresh(googleConfig) }
+    // A reconnect reuses the same OAuth flow; passing connectionId binds the attempt to the existing identity.
+    const authorize = async (inbox: Inbox, owner: string, origin: string, connectionId?: string): Promise<ConnectResult> => {
+      if (origin !== config.web.origin) throw new InboxError('HOST_OAUTH_ORIGIN_REQUIRED', 'Open the configured web.origin before starting OAuth so its session and callback stay on the same origin.', 409)
+      const attempt = await oauth(inbox).start(owner, connectionId === undefined ? {} : { connectionId })
+      if (!attempt.authorizeUrl) throw new InboxError('HOST_OAUTH_UNAVAILABLE', 'OAuth could not be started.', 503)
+      const url = new URL(attempt.authorizeUrl)
+      if (url.origin !== config.web.origin) throw new InboxError('HOST_OAUTH_UNAVAILABLE', 'OAuth origin does not match the local web origin.', 503)
+      return { authorizeUrl: `${url.pathname}${url.search}` }
+    }
     return {
       definition,
-      descriptor: describeProvider(definition, { ready: !!googleConfig,
+      descriptor: describeProvider(definition, { ready: !!googleConfig, reconnect: !!googleConfig,
         setupMessage: `Set providers.${base.id}.oauth.clientId and clientSecret in superlocal.local.json (or their explicit environment references), register web.origin + ${callbackPath} with Google, then restart.` }),
-      async connect(inbox, owner, _credentials, origin) {
-        if (origin !== config.web.origin) throw new InboxError('HOST_OAUTH_ORIGIN_REQUIRED', 'Open the configured web.origin before starting OAuth so its session and callback stay on the same origin.', 409)
-        const attempt = await oauth(inbox).start(owner)
-        if (!attempt.authorizeUrl) throw new InboxError('HOST_OAUTH_UNAVAILABLE', 'OAuth could not be started.', 503)
-        const url = new URL(attempt.authorizeUrl)
-        if (url.origin !== config.web.origin) throw new InboxError('HOST_OAUTH_UNAVAILABLE', 'OAuth origin does not match the local web origin.', 503)
-        return { authorizeUrl: `${url.pathname}${url.search}` }
+      connect(inbox, owner, _credentials, origin) {
+        return authorize(inbox, owner, origin)
+      },
+      reconnect(inbox, owner, connectionId, _credentials, origin) {
+        return authorize(inbox, owner, origin, connectionId)
       },
       mount(inbox, authenticate) {
         const api = createGoogleOAuthApi({ oauth: () => oauth(inbox), authenticate, allowedOrigins: config.web.allowedOrigins })
