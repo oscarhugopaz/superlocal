@@ -3078,7 +3078,9 @@ export function createInbox(options: InboxOptions): Inbox {
         const seen = new Set<string>()
         const unique = (values: Participant[]) => values.filter(p => { const email = p.email.toLowerCase(); if (own.has(email) || seen.has(email)) return false; seen.add(email); return true })
         if (input.mode === 'reply' || input.mode === 'replyAll') {
-          const to = unique([...(body.replyTo?.length ? body.replyTo : [base.from]), ...(input.mode === 'replyAll' ? base.to : [])])
+          // A message this account sent has its own From: reply to the people it was sent to instead of dropping the only target as a self alias.
+          const addressed = body.replyTo?.length ? body.replyTo : base.folder === 'sent' ? base.to : [base.from]
+          const to = unique([...addressed, ...(input.mode === 'replyAll' ? base.to : [])])
           const cc = input.mode === 'replyAll' ? unique(base.cc) : []
           prepared = { ...prepared, to: input.to ?? to, cc: input.cc ?? cc, bcc: input.bcc ?? [], subject: input.subject ?? (/^re:/i.test(base.subject) ? base.subject : `Re: ${base.subject}`) }
         } else if (input.mode === 'forward') prepared = { ...prepared, subject: input.subject ?? `Fwd: ${base.subject}`, bodyText: input.bodyText ?? body.bodyText, bodyHtml: input.bodyHtml ?? body.bodyHtml, attachmentIds: input.attachmentIds ?? body.attachments.map((blob: BlobInfo) => blob.id) }
