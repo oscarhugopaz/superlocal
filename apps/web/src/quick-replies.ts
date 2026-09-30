@@ -38,18 +38,22 @@ export function getQuickReplies(
     : defaultReplies;
 }
 
-export function canUseQuickReplies(
-  draft: Pick<Draft, "mode" | "body">,
-): boolean {
-  if (draft.mode !== "reply" && draft.mode !== "replyAll") return false;
+export function emptyDraftBody(body: string): boolean {
   // Only empty editor formatting is disposable; preserve images, links, and quotes.
-  return !draft.body
+  return !body
     .replace(
       /<\/?(?:p|div|span|br|b|strong|i|em|u|s|strike|font)\b[^>]*>/gi,
       "",
     )
     .replace(/&nbsp;|&#160;|\u00a0|\u200b|\ufeff/g, " ")
     .trim();
+}
+
+export function canUseQuickReplies(
+  draft: Pick<Draft, "mode" | "body">,
+): boolean {
+  if (draft.mode !== "reply" && draft.mode !== "replyAll") return false;
+  return emptyDraftBody(draft.body);
 }
 
 export function quickReplyBody(

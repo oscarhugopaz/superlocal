@@ -7856,6 +7856,12 @@ describe('source-scoped sending identities', () => {
       const draft = await h.inbox.createDraft('alice', { accountId: account.id, mode: 'reply', sourceMessageId: rows.find(row => row.subject === `Subject ${subject}`)!.id })
       expect(draft.from).toBe(from)
     }
+    // A message this account sent is authored by its own sender: its recipients stay the reply targets.
+    const ownSent = rows.find(row => row.subject === 'Subject own-sent')!
+    const ownSentReply = await h.inbox.createDraft('alice', { accountId: account.id, mode: 'reply', sourceMessageId: ownSent.id })
+    expect(ownSentReply.to).toEqual([participant('recipient@example.test')]); expect(ownSentReply.cc).toEqual([])
+    const ownSentAll = await h.inbox.createDraft('alice', { accountId: account.id, mode: 'replyAll', sourceMessageId: ownSent.id })
+    expect(ownSentAll.to).toEqual([participant('recipient@example.test')]); expect(ownSentAll.cc).toEqual([])
     expect((await h.inbox.createDraft('alice', { accountId: account.id })).from).toBe(primary.email)
     const explicit = await h.inbox.createDraft('alice', { accountId: account.id, mode: 'reply', sourceMessageId: source.id, from: second.email })
     const edited = await h.inbox.updateDraft('alice', explicit.id, { bodyText: 'Keep my chosen sender' }, explicit.revision)
